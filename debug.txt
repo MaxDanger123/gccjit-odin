@@ -1,0 +1,1 @@
+odin build tut4 -debug
