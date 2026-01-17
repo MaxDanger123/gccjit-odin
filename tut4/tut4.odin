@@ -7,7 +7,7 @@ import "core:os"
 import "core:strconv"
 import "../gccjit"
 
-//loop_test_fn_type :: proc(_: int) -> int
+compiled_code :: proc(_: int) -> int
 
 Opcode :: enum {
     /* Ops taking no operand.  */
@@ -40,8 +40,6 @@ opcode_names := [?]string {
     "PUSH_CONST",
     "JUMP_ABS_IF_TRUE",
 }
-
-//v := Vector2{1, 2}
 
 op :: struct {
     code: Opcode,
@@ -81,20 +79,23 @@ add_unary_op :: proc(fn: ^function, opcode: Opcode, rest_of_line: string, linenu
     add_op(fn, opcode, operand, linenum);
 }
 
-get_function_name :: proc(filename: ^string) -> (string, bool) {
-    pathsep := strings.last_index_byte(filename^, '/');
-    if(pathsep != -1) {
-        filename := filename[pathsep:9];
-        pathsep = strings.last_index_byte(filename, '.');
-        if(pathsep != -1) {
-            filename := filename[0:pathsep];
-            return filename, true;
-        } else {
-            return "", false;
-        }
-    } else {
-        return "", false;
+get_function_name :: proc(filename: string) -> string {
+    // Skip any path separators
+    result := filename
+    pathsep := strings.last_index_byte(result, '/')
+    if pathsep >= 0 {
+        result = result[pathsep + 1:]
     }
+    
+    // Truncate at first '.'
+    dot_index := strings.index_byte(result, '.')
+    if dot_index >= 0 {
+        result = result[:dot_index]
+    }
+    
+    // Return allocated copy
+    //return strings.clone(result)
+    return result;
 }
 
 line_matches :: proc(opcode: string, line: string) -> bool {
@@ -286,13 +287,289 @@ function_interpret :: proc(fn: ^function, arg: int, trace: ^os.Handle) -> int {
     }
 }
 
+// --- JIT COMPILATION ---
+
+compilation_state :: struct {
+    ctxt: ^gccjit.gcc_jit_context,
+
+    int_type: ^gccjit.gcc_jit_type,
+    bool_type: ^gccjit.gcc_jit_type,
+    stack_type: ^gccjit.gcc_jit_type,
+
+    const_one: ^gccjit.gcc_jit_rvalue,
+
+    fn: ^gccjit.gcc_jit_function,
+    param_arg: ^gccjit.gcc_jit_param,
+    stack: ^gccjit.gcc_jit_lvalue,
+    stack_depth: ^gccjit.gcc_jit_lvalue,
+    x: ^gccjit.gcc_jit_lvalue,
+    y: ^gccjit.gcc_jit_lvalue,
+
+    op_locs: [max_ops]^gccjit.gcc_jit_location,
+    initial_block: ^gccjit.gcc_jit_block,
+    op_blocks: [max_ops]^gccjit.gcc_jit_block
+}
+
+add_push :: proc(state: ^compilation_state, block: ^gccjit.gcc_jit_block,
+    rvalue: ^gccjit.gcc_jit_rvalue, loc: ^gccjit.gcc_jit_location) {
+    using gccjit
+    // stack[stack_depth]
+    stack_stack_depth := gcc_jit_context_new_array_access(state.ctxt, loc, 
+        gcc_jit_lvalue_as_rvalue(state.stack), 
+        gcc_jit_lvalue_as_rvalue(state.stack_depth));
+    // stack[stack_depth] = RVALUE
+    gcc_jit_block_add_assignment(block, loc, stack_stack_depth, rvalue);
+
+    // stack_depth++
+    gcc_jit_block_add_assignment_op(block, loc, state.stack_depth, 
+        gcc_jit_binary_op.PLUS, state.const_one);
+}
+
+add_pop :: proc(state: ^compilation_state, block: ^gccjit.gcc_jit_block,
+    lvalue: ^gccjit.gcc_jit_lvalue, loc: ^gccjit.gcc_jit_location) {
+    using gccjit
+    
+    // --stack_depth
+    gcc_jit_block_add_assignment_op(block, loc, state.stack_depth,
+        gcc_jit_binary_op.MINUS, state.const_one);
+    // stack[stack_depth]
+    stack_stack_depth := gcc_jit_context_new_array_access(state.ctxt, loc, 
+        gcc_jit_lvalue_as_rvalue(state.stack), 
+        gcc_jit_lvalue_as_rvalue(state.stack_depth));
+    // LVALUE = stack[stack_depth]
+    gcc_jit_block_add_assignment(block, loc, lvalue, 
+        gcc_jit_lvalue_as_rvalue(stack_stack_depth));
+}
+
+compiled_function :: struct {
+    jit_result: gccjit.gcc_jit_result,
+    code: compiled_code,
+}
+
+function_compile :: proc(fn: ^function) -> ^compiled_function {
+    using gccjit
+
+    state := compilation_state{};
+    pc: int;
+    funcname := get_function_name(fn.filename);
+    //fmt.printfln("funcname = %s", funcname);
+
+    state.ctxt = gcc_jit_context_acquire();
+
+    gcc_jit_context_set_bool_option (state.ctxt,
+				   gcc_jit_bool_option.BOOL_OPTION_DUMP_INITIAL_GIMPLE,
+				   0);
+    gcc_jit_context_set_bool_option (state.ctxt,
+				   gcc_jit_bool_option.BOOL_OPTION_DUMP_GENERATED_CODE,
+				   0);
+    gcc_jit_context_set_int_option (state.ctxt,
+				    gcc_jit_int_option.INT_OPTION_OPTIMIZATION_LEVEL,
+				  3);
+    gcc_jit_context_set_bool_option (state.ctxt,
+				   gcc_jit_bool_option.BOOL_OPTION_KEEP_INTERMEDIATES,
+				   0);
+    gcc_jit_context_set_bool_option (state.ctxt,
+				   gcc_jit_bool_option.BOOL_OPTION_DUMP_EVERYTHING,
+				   0);
+    gcc_jit_context_set_bool_option (state.ctxt,
+				   gcc_jit_bool_option.BOOL_OPTION_DEBUGINFO,
+				   1);
+
+    // create types
+    state.int_type = gcc_jit_context_get_type(state.ctxt, gcc_jit_types.INT);
+    state.bool_type = gcc_jit_context_get_type(state.ctxt, gcc_jit_types.BOOL);
+    state.stack_type = gcc_jit_context_new_array_type(state.ctxt, nil, state.int_type, 
+        max_stack_depth);
+
+    // the constant value 1
+    state.const_one = gcc_jit_context_one(state.ctxt, state.int_type);
+
+    // create locations
+    for pc in 0..<fn.num_ops {
+        op := &fn.ops[pc];
+        
+        state.op_locs[pc] = gcc_jit_context_new_location(state.ctxt, 
+            strings.clone_to_cstring(fn.filename), 
+            cast(i32)op.linenum, 0);
+    }
+
+    // creating the function
+    state.param_arg = gcc_jit_context_new_param(state.ctxt, state.op_locs[0], 
+        state.int_type, "arg");
+    state.fn = gcc_jit_context_new_function(state.ctxt, state.op_locs[0],
+        gcc_jit_function_kind.EXPORTED, state.int_type, 
+        strings.clone_to_cstring(funcname), 1, &state.param_arg, 0);
+
+    // create stack lvalues
+    state.stack = gcc_jit_function_new_local(state.fn, nil, state.stack_type, "stack");
+    state.stack_depth = gcc_jit_function_new_local(state.fn, nil, state.int_type, "stack_depth");
+    state.x = gcc_jit_function_new_local(state.fn, nil, state.int_type, "x");
+    state.y = gcc_jit_function_new_local(state.fn, nil, state.int_type, "y");
+
+    /* 1st pass: create blocks, one per opcode. */
+
+    /* We need an entry block to do one-time initialization, so create that
+     first.  */
+
+    state.initial_block = gcc_jit_function_new_block(state.fn, "initial");
+
+    // create a block per operation
+    for pc in 0..<fn.num_ops {
+        instr := fmt.tprintf("instr%i", pc);
+        state.op_blocks[pc] = gcc_jit_function_new_block(state.fn, 
+            strings.clone_to_cstring(instr));
+        
+        // fmt.printfln("fn.num_ops = %d", fn.num_ops);
+        // fmt.printfln("state.op_blocks[pc]: %s", 
+        //     gcc_jit_object_get_debug_string(gcc_jit_block_as_object(state.op_blocks[pc])));
+    }
+
+    // populate the initial block
+
+    // stack_depth = 0;
+    gcc_jit_block_add_assignment(state.initial_block, state.op_locs[0], 
+        state.stack_depth, gcc_jit_context_zero(state.ctxt, state.int_type));
+
+    // PUSH(arg);
+    add_push(&state, state.initial_block, 
+        gcc_jit_param_as_rvalue(state.param_arg), state.op_locs[0]);
+
+    //fmt.printfln("state.op_blocks[0] = %p", state.op_blocks[0]);
+    // ...and jump to insn0
+    gcc_jit_block_end_with_jump(state.initial_block, state.op_locs[0], state.op_blocks[0]);
+
+    /// 2nd pass: fill in instructions
+    for pc in 0..<fn.num_ops {
+        loc := state.op_locs[pc];
+
+        block := state.op_blocks[pc];
+        next_block: ^gcc_jit_block = (pc < fn.num_ops ? state.op_blocks[pc+1] : nil);
+
+        op := &fn.ops[pc];
+
+        //helper "macros" (functions)
+        x_equals_pop :: proc(state: ^compilation_state, block: ^gcc_jit_block, 
+            loc: ^gcc_jit_location) {
+            add_pop(state, block, state.x, loc);
+        }
+
+        y_equals_pop :: proc(state: ^compilation_state, block: ^gcc_jit_block, 
+            loc: ^gcc_jit_location) {
+            add_pop(state, block, state.y, loc);
+        }
+
+        push_rvalue :: proc(state: ^compilation_state, block: ^gcc_jit_block,
+            rvalue: ^gccjit.gcc_jit_rvalue, loc: ^gcc_jit_location) {
+                add_push(state, block, rvalue, loc);
+        }
+
+        push_x :: proc(state: ^compilation_state, block: ^gcc_jit_block,
+            loc: ^gcc_jit_location) {
+            push_rvalue(state, block, gcc_jit_lvalue_as_rvalue(state.x), loc);
+        }
+
+        push_y :: proc(state: ^compilation_state, block: ^gcc_jit_block,
+            loc: ^gcc_jit_location) {
+            push_rvalue(state, block, gcc_jit_lvalue_as_rvalue(state.y), loc);
+        }
+
+        // gcc_jit_block_add_comment(block, loc, 
+        //     strings.clone_to_cstring(opcode_names[op.operand]));
+
+        // handle the individual opcodes
+
+        switch op.code {
+            case .DUP:
+                x_equals_pop(&state, block, loc);
+                push_x(&state, block, loc);
+                push_x(&state, block, loc);
+            case .ROT:
+                y_equals_pop(&state, block, loc);
+                x_equals_pop(&state, block, loc);
+                push_y(&state, block, loc);
+                push_x(&state, block, loc);
+            case .BINARY_ADD:
+                y_equals_pop(&state, block, loc);
+                x_equals_pop(&state, block, loc);
+                push_rvalue(&state, block, 
+                    gcc_jit_context_new_binary_op(
+                        state.ctxt, loc, gcc_jit_binary_op.PLUS, state.int_type, 
+                        gcc_jit_lvalue_as_rvalue(state.x), 
+                        gcc_jit_lvalue_as_rvalue(state.y)), loc);
+            case .BINARY_SUBTRACT:
+                y_equals_pop(&state, block, loc);
+                x_equals_pop(&state, block, loc);
+                push_rvalue(&state, block, 
+                    gcc_jit_context_new_binary_op(
+                        state.ctxt, loc, gcc_jit_binary_op.MINUS, state.int_type, 
+                        gcc_jit_lvalue_as_rvalue(state.x), 
+                        gcc_jit_lvalue_as_rvalue(state.y)), loc);
+            case .BINARY_MULT:
+                y_equals_pop(&state, block, loc);
+                x_equals_pop(&state, block, loc);
+                push_rvalue(&state, block, 
+                    gcc_jit_context_new_binary_op(
+                        state.ctxt, loc, gcc_jit_binary_op.MULT, state.int_type, 
+                        gcc_jit_lvalue_as_rvalue(state.x), 
+                        gcc_jit_lvalue_as_rvalue(state.y)), loc);
+            case .BINARY_COMPARE_LT:
+                y_equals_pop(&state, block, loc);
+                x_equals_pop(&state, block, loc);
+                push_rvalue(&state, block, 
+                    gcc_jit_context_new_cast(
+                        state.ctxt, loc,
+                        gcc_jit_context_new_comparison(
+                            state.ctxt,
+                            loc, gcc_jit_comparison.LT, 
+                            gcc_jit_lvalue_as_rvalue(state.x), 
+                            gcc_jit_lvalue_as_rvalue(state.y)), 
+                        state.int_type), loc);
+            case .RECURSE:
+                x_equals_pop(&state, block, loc);
+                arg := gcc_jit_lvalue_as_rvalue(state.x);
+                push_rvalue(&state, block,
+                    gcc_jit_context_new_call(state.ctxt, loc, state.fn, 1, &arg),
+                    loc);
+            case .RETURN:
+                x_equals_pop(&state, block, loc);
+                gcc_jit_block_end_with_return(block, loc, 
+                    gcc_jit_lvalue_as_rvalue(state.x));
+            case .PUSH_CONST:
+                push_rvalue(&state, block,
+                    gcc_jit_context_new_rvalue_from_int(
+                        state.ctxt, state.int_type, cast(i32)op.operand),
+                    loc);
+            case .JUMP_ABS_IF_TRUE:
+                x_equals_pop(&state, block, loc);
+                gcc_jit_block_end_with_conditional(block, loc,
+                    gcc_jit_context_new_cast(state.ctxt, loc,
+                        gcc_jit_lvalue_as_rvalue(state.x), state.bool_type),
+                state.op_blocks[op.operand], next_block);
+        } // end of switch on opcode
+
+        if(op.code != .JUMP_ABS_IF_TRUE && op.code != .RETURN) {
+            gcc_jit_block_end_with_jump(block, loc, next_block);
+        }
+    } // end of loop on pc locations
+
+    gcc_jit_context_set_bool_option (state.ctxt,
+        gcc_jit_bool_option.BOOL_OPTION_DUMP_GENERATED_CODE, 0);
+    /* We've now finished populating the context.  Compile it.  */
+    jit_result := gcc_jit_context_compile(state.ctxt);
+    gcc_jit_context_release(state.ctxt);
+
+    result := new(compiled_function);
+    result.jit_result = jit_result^;
+    result.code = cast(compiled_code)gcc_jit_result_get_code(jit_result, 
+        strings.clone_to_cstring(funcname));
+
+    /* (this leaks "jit_result" and "funcname") */
+    
+    return result;
+}
+
 test_script :: proc(scripts_dir: string, script_name: string, input: int, 
     expected_result: int) {
-    
-    // toyvm_compiled_function *compiled_fn;
-    // toyvm_compiled_code code;
-    // int compiled_result;
-
     to_be_concat := [?]string{scripts_dir, script_name};
     script_path := strings.concatenate(to_be_concat[:]);
 
@@ -315,17 +592,27 @@ test_script :: proc(scripts_dir: string, script_name: string, input: int,
         os.exit(1);
     }
 
-    // compiled_fn = toyvm_function_compile (fn);
-    // CHECK_NON_NULL (compiled_fn);
+    compiled_fn := function_compile(fn);
+    defer free(compiled_fn);
+    if(compiled_fn != nil) {
+        fmt.printfln("function compiling succeeded (?)");
+    } else {
+        fmt.printfln("function compiling failed");
+        os.exit(1);
+    }
 
-    // code = (toyvm_compiled_code)compiled_fn->cf_code;
+    code := cast(compiled_code)compiled_fn.code;
     // CHECK_NON_NULL (code);
 
-    // compiled_result = code (input);
-    // CHECK_VALUE (compiled_result, expected_result);
+    compiled_result := code(input);
+    if(compiled_result == expected_result) {
+        fmt.printfln("COMPILED actual: %d == expected: %d", compiled_result, expected_result);
+    } else {
+        fmt.printfln("COMPILED actual: %d == expected: %d", compiled_result, expected_result);
+        os.exit(1);
+    }
 
-    // gcc_jit_result_release (compiled_fn->cf_jit_result);
-    // free (compiled_fn);
+    //gccjit.gcc_jit_result_release(&compiled_fn.jit_result);
 }
 
 path_to_scripts :: ""
